@@ -104,6 +104,117 @@ def _extract_gps_from_strm(children):
 
 
 # ---------------------------------------------------------------------------
+# Accelerometer (ACCL) extraction
+# ---------------------------------------------------------------------------
+
+def _extract_accl_from_strm(children):
+    """Extract ACCL accelerometer samples from a single STRM."""
+    scale = None
+    samples = []
+    for fourcc, typ, val in children:
+        if fourcc == 'SCAL':
+            ss_s, _, raw_s = val
+            if typ == 'l':
+                scale = [struct.unpack('>i', raw_s[i*4:(i+1)*4])[0]
+                         for i in range(len(raw_s) // 4)]
+            elif typ == 's':
+                scale = [struct.unpack('>h', raw_s[i*2:(i+1)*2])[0]
+                         for i in range(len(raw_s) // 2)]
+        if fourcc == 'ACCL':
+            ss, repeat, raw = val
+            if typ == 's':
+                fields = ss // 2
+                for i in range(repeat):
+                    offset = i * ss
+                    values = []
+                    for j in range(fields):
+                        v = struct.unpack('>h', raw[offset+j*2:offset+j*2+2])[0]
+                        if scale:
+                            s = scale[j] if j < len(scale) else scale[-1]
+                            if s != 0:
+                                v = v / s
+                        values.append(v)
+                    if len(values) >= 3:
+                        samples.append((values[0], values[1], values[2]))
+    return samples
+
+
+def extract_all_accl(data):
+    """Walk all DEVC containers and collect accelerometer samples."""
+    samples = []
+    pos = 0
+    while pos + 8 <= len(data):
+        fourcc = data[pos:pos+4].decode('ascii', errors='replace')
+        type_byte = data[pos+4]
+        ss = data[pos+5]
+        repeat = struct.unpack('>H', data[pos+6:pos+8])[0]
+        total = ss * repeat
+        padded = (total + 3) & ~3
+        if fourcc == 'DEVC' and type_byte == 0:
+            children = parse_gpmf(data, pos+8, pos+8+padded)
+            for fc, typ, val in children:
+                if fc == 'STRM' and typ == 'container':
+                    if any(cc == 'ACCL' for cc, _, _ in val):
+                        samples.extend(_extract_accl_from_strm(val))
+        pos += 8 + padded
+    return samples
+
+
+def compute_pitch_angles(accl_samples, video_duration, video_fps,
+                         exaggeration=3.0, smooth_window_sec=1.5,
+                         max_degrees=15.0):
+    """Compute per-frame roll angles from accelerometer data.
+
+    Returns list of angles in radians, one per video frame.
+    GoPro ACCL axes (camera upright, lens forward): [Y-down, X-right, Z-forward].
+    Roll = atan2(X, -Y) measures lateral tilt from cornering forces.
+    The accelerometer naturally combines centripetal + road camber.
+    Angles are clamped to ±max_degrees after exaggeration.
+    """
+    if not accl_samples:
+        return []
+
+    accl_rate = len(accl_samples) / video_duration
+
+    raw_pitch = []
+    for y, x, z in accl_samples:
+        raw_pitch.append(math.atan2(x, -y))
+
+    median_pitch = sorted(raw_pitch)[len(raw_pitch) // 2]
+    raw_pitch = [p - median_pitch for p in raw_pitch]
+
+    # Handle angular wrapping: clamp raw deviations to ±π/2
+    half_pi = math.pi / 2
+    raw_pitch = [max(-half_pi, min(half_pi, p)) for p in raw_pitch]
+
+    window = max(1, int(smooth_window_sec * accl_rate))
+    smoothed = []
+    for i in range(len(raw_pitch)):
+        start = max(0, i - window // 2)
+        end = min(len(raw_pitch), i + window // 2 + 1)
+        smoothed.append(sum(raw_pitch[start:end]) / (end - start))
+
+    max_rad = math.radians(max_degrees)
+    total_frames = int(video_duration * video_fps)
+    angles = []
+    for frame in range(total_frames):
+        t = frame / video_fps
+        accl_idx = min(int(t * accl_rate), len(smoothed) - 1)
+        a = smoothed[accl_idx] * exaggeration
+        angles.append(max(-max_rad, min(max_rad, a)))
+
+    return angles
+
+
+def _write_pitch_cmdfile(path, angles, video_fps):
+    """Write ffmpeg sendcmd file for per-frame pitch rotation."""
+    with open(path, 'w') as f:
+        for i, angle in enumerate(angles):
+            t = i / video_fps
+            f.write(f"{t:.4f} rotate a {angle:.6f};\n")
+
+
+# ---------------------------------------------------------------------------
 # Map tile rendering
 # ---------------------------------------------------------------------------
 
@@ -349,6 +460,11 @@ def main():
                         help='Skip the zoom-in intro animation')
     parser.add_argument('--no-audio', action='store_true',
                         help='Drop all audio tracks from the output')
+    parser.add_argument('--tblend', action='store_true',
+                        help='Blend adjacent frames (subtle motion blur)')
+    parser.add_argument('--pitch', type=float, default=None, metavar='MULT',
+                        help='Exaggerate pitch rotation from accelerometer '
+                             '(e.g. --pitch 3 for 3x)')
     parser.add_argument('--output', '-o', default=None,
                         help='Output file path (default: <input>_map.mp4)')
     args = parser.parse_args()
@@ -380,6 +496,14 @@ def main():
         print("  No GPS data found in this file.")
         sys.exit(1)
 
+    accl_samples = []
+    if args.pitch:
+        accl_samples = extract_all_accl(gpmf_data)
+        print(f"  {len(accl_samples)} ACCL samples", flush=True)
+        if not accl_samples:
+            print("  Warning: no accelerometer data found, skipping pitch rotation")
+            args.pitch = None
+
     # --- Step 2: Probe video metadata ---
     probe = subprocess.run(
         ['ffprobe', '-v', 'quiet', '-print_format', 'json',
@@ -389,6 +513,12 @@ def main():
     vs = [s for s in probe_data['streams'] if s['codec_type'] == 'video'][0]
     vid_w, vid_h = int(vs['width']), int(vs['height'])
     duration = float(vs['duration'])
+    fps_str = vs.get('avg_frame_rate', '30/1')
+    if '/' in fps_str:
+        fps_n, fps_d = fps_str.split('/')
+        video_fps = float(fps_n) / float(fps_d)
+    else:
+        video_fps = float(fps_str)
 
     creation_time = None
     for source in [probe_data.get('format', {}).get('tags', {}),
@@ -415,6 +545,14 @@ def main():
     map_size = args.size or min(out_w, out_h) // 4
     cruise_zoom = args.zoom or CRUISE_ZOOM
     intro_frames = 0 if args.no_intro else int(INTRO_DURATION * args.hz)
+
+    pitch_angles = []
+    if args.pitch and accl_samples:
+        pitch_angles = compute_pitch_angles(
+            accl_samples, duration, video_fps, exaggeration=args.pitch)
+        max_deg = max(abs(a) for a in pitch_angles) * 180 / math.pi
+        print(f"  Roll: {len(pitch_angles)} frames, max {max_deg:.1f}° "
+              f"(x{args.pitch} exaggeration)", flush=True)
 
     print(f"  Video: {vid_w}x{vid_h} -> {out_w}x{out_h}, {duration:.1f}s", flush=True)
     print(f"  Map: {map_size}x{map_size}px, cruise zoom {cruise_zoom}, {args.map}",
@@ -486,13 +624,37 @@ def main():
     margin = 10
     overlay_x = out_w - map_size - margin
     overlay_y = out_h - map_size - margin
-    scale_filter = f"[0:v]scale={out_w}:{out_h}[base];" if args.scale else ""
-    base_label = "[base]" if args.scale else "[0:v]"
-    filter_str = (
-        f"{scale_filter}"
-        f"[1:v]fps={args.hz}[map];"
-        f"{base_label}[map]overlay={overlay_x}:{overlay_y}:shortest=1"
-    )
+
+    # Build filter chain piece by piece
+    parts = []
+    video_label = "[0:v]"
+
+    if args.scale:
+        parts.append(f"[0:v]scale={out_w}:{out_h}[base]")
+        video_label = "[base]"
+
+    pitch_cmdfile = None
+    if pitch_angles:
+        pitch_cmdfile = os.path.join(os.path.dirname(input_mp4),
+                                     '_pitch_cmd.txt')
+        _write_pitch_cmdfile(pitch_cmdfile, pitch_angles, video_fps)
+        cmd_rel = os.path.basename(pitch_cmdfile)
+        parts.append(f"{video_label}sendcmd=f={cmd_rel}[_cmd]")
+        parts.append(f"[_cmd]rotate=a=0:ow=iw:oh=ih:fillcolor=black[rotated]")
+        video_label = "[rotated]"
+
+    parts.append(f"[1:v]fps={args.hz}[map]")
+
+    overlay_out = "[comp]" if args.tblend else ""
+    parts.append(
+        f"{video_label}[map]overlay={overlay_x}:{overlay_y}"
+        f":shortest=1{overlay_out}")
+
+    if args.tblend:
+        parts.append("[comp]tblend=all_mode=average")
+
+    filter_str = ";".join(parts)
+
     audio_args = ['-an'] if args.no_audio else ['-c:a', 'aac', '-b:a', '128k']
     qsv_cmd = (
         ['ffmpeg', '-y', '-i', input_mp4,
@@ -509,16 +671,23 @@ def main():
          '-pix_fmt', 'yuv420p']
         + audio_args + [output_mp4]
     )
-    result = subprocess.run(qsv_cmd, capture_output=True)
+    encode_cwd = os.path.dirname(input_mp4) or '.'
+    result = subprocess.run(qsv_cmd, capture_output=True, cwd=encode_cwd)
     if result.returncode != 0:
         print("  QSV unavailable, falling back to libx264...", flush=True)
-        result = subprocess.run(sw_cmd, capture_output=True)
+        result = subprocess.run(sw_cmd, capture_output=True, cwd=encode_cwd)
         if result.returncode != 0:
             print(f"  Encode error: {result.stderr[-500:]}", flush=True)
     else:
         print("  Encoded with Intel QSV", flush=True)
 
+    if pitch_cmdfile and os.path.isfile(pitch_cmdfile):
+        os.unlink(pitch_cmdfile)
+
     shutil.rmtree(frames_dir)
+    if not os.path.isfile(output_mp4):
+        print("\nError: encoding failed, no output produced.", flush=True)
+        sys.exit(1)
     size_mb = os.path.getsize(output_mp4) / (1024 * 1024)
     print(f"\nDone! {output_mp4}", flush=True)
     print(f"  {size_mb:.1f} MB, {duration:.0f}s at {args.hz} fps", flush=True)
