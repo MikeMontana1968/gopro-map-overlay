@@ -161,7 +161,7 @@ def prefetch_tiles(points, zoom_levels, map_size, map_type):
     """Pre-fetch all tiles needed for the route at all zoom levels."""
     import time
     needed = set()
-    padding = 3
+    padding = 2
     tiles_needed = (map_size // 256) + padding + 1
     half = tiles_needed // 2
 
@@ -231,7 +231,7 @@ def render_map(center_lat, center_lon, trail, map_size, zoom, map_type,
     """
     cx, cy = _ll_to_tile(center_lat, center_lon, zoom)
     # Fetch extra tiles to allow rotation without blank corners
-    padding = 2 if heading is None else 3
+    padding = 2
     tiles_needed = (map_size // 256) + padding + 1
     half = tiles_needed // 2
     canvas_size = tiles_needed * 256
