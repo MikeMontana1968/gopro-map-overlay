@@ -317,6 +317,8 @@ def main():
                         help='Override zoom level (auto-detected by default)')
     parser.add_argument('--size', type=int, default=None,
                         help='Map size in pixels (default: 1/4 of video height)')
+    parser.add_argument('--no-intro', action='store_true',
+                        help='Skip the zoom-in intro animation')
     parser.add_argument('--output', '-o', default=None,
                         help='Output file path (default: <input>_map_overlay.mp4)')
     args = parser.parse_args()
@@ -374,17 +376,18 @@ def main():
 
     map_size = args.size or min(vid_w, vid_h) // 4
     cruise_zoom = args.zoom or CRUISE_ZOOM
-    intro_frames = int(INTRO_DURATION * args.hz)
+    intro_frames = 0 if args.no_intro else int(INTRO_DURATION * args.hz)
 
     print(f"  Video: {vid_w}x{vid_h}, {duration:.1f}s", flush=True)
     print(f"  Map: {map_size}x{map_size}px, cruise zoom {cruise_zoom}, {args.map}",
           flush=True)
-    print(f"  Intro: {INTRO_DURATION}s zoom {INTRO_ZOOM_START} -> {cruise_zoom}",
-          flush=True)
+    if intro_frames:
+        print(f"  Intro: {INTRO_DURATION}s zoom {INTRO_ZOOM_START} -> {cruise_zoom}",
+              flush=True)
 
     # --- Step 2b: Pre-fetch map tiles ---
     print("Pre-fetching map tiles...", flush=True)
-    all_zooms = list(range(INTRO_ZOOM_START, cruise_zoom + 1))
+    all_zooms = [cruise_zoom] if args.no_intro else list(range(INTRO_ZOOM_START, cruise_zoom + 1))
     # Only sample every Nth point for prefetch (no need to check all 9000+)
     sample_step = max(1, len(points) // 200)
     sample_points = points[::sample_step] + [points[-1]]
