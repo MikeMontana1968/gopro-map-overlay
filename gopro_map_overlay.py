@@ -18,7 +18,7 @@ import json
 from io import BytesIO
 from urllib.request import urlopen, Request
 from datetime import datetime, timedelta
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +298,32 @@ def render_map(center_lat, center_lon, trail, map_size, zoom, map_type,
     return cropped
 
 
+def _apply_rounded_corner(img, radius=20, fade=5):
+    """Add a rounded top-left corner with alpha-blended soft edges."""
+    w, h = img.size
+    rgba = img.convert('RGBA')
+
+    # Sharp rounded-rect mask (top-left rounded, other corners square)
+    mask = Image.new('L', (w, h), 255)
+    md = ImageDraw.Draw(mask)
+    # Draw rounded rect, then fill back the three square corners
+    md.rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
+    # The rounded_rectangle rounds all four corners; restore the three we want square
+    md.rectangle([w - radius, 0, w, radius], fill=255)       # top-right
+    md.rectangle([0, h - radius, radius, h], fill=255)       # bottom-left
+    md.rectangle([w - radius, h - radius, w, h], fill=255)   # bottom-right
+    # Clear the top-left corner area, then redraw just that arc
+    md.rectangle([0, 0, radius, radius], fill=0)
+    md.ellipse([0, 0, radius * 2, radius * 2], fill=255)
+
+    # Soften the mask edges
+    if fade > 0:
+        mask = mask.filter(ImageFilter.GaussianBlur(fade))
+
+    rgba.putalpha(mask)
+    return rgba
+
+
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
@@ -319,8 +345,10 @@ def main():
                         help='Map size in pixels (default: 1/4 of video height)')
     parser.add_argument('--no-intro', action='store_true',
                         help='Skip the zoom-in intro animation')
+    parser.add_argument('--no-audio', action='store_true',
+                        help='Drop all audio tracks from the output')
     parser.add_argument('--output', '-o', default=None,
-                        help='Output file path (default: <input>_map_overlay.mp4)')
+                        help='Output file path (default: <input>_map.mp4)')
     args = parser.parse_args()
 
     input_mp4 = args.input
@@ -330,7 +358,7 @@ def main():
 
     basename = os.path.splitext(os.path.basename(input_mp4))[0]
     output_mp4 = args.output or os.path.join(
-        os.path.dirname(input_mp4), f"{basename}_map_overlay.mp4")
+        os.path.dirname(input_mp4), f"{basename}_map.mp4")
 
     # --- Step 1: Extract GPMF telemetry ---
     print("Extracting GPS telemetry...", flush=True)
@@ -436,31 +464,51 @@ def main():
                          map_size, zoom, args.map,
                          timestamp=ts, speed_mph=speed_mph, heading=heading)
 
-        bordered = Image.new('RGB', (map_size + 4, map_size + 4), (255, 255, 255))
-        bordered.paste(img, (2, 2))
-        bordered.save(os.path.join(frames_dir, f"frame_{idx:06d}.png"))
+        frame = _apply_rounded_corner(img, radius=20, fade=5)
+        frame.save(os.path.join(frames_dir, f"frame_{idx:06d}.png"))
 
         if (idx + 1) % 100 == 0:
             print(f"  {idx + 1}/{total_frames}", flush=True)
 
-    # --- Step 4: Encode overlay video ---
+    # --- Step 4: Composite map onto source video ---
+    print("Compositing onto source video...", flush=True)
     input_pattern = os.path.join(frames_dir, 'frame_%06d.png')
-    base_args = ['ffmpeg', '-y', '-framerate', str(args.hz), '-i', input_pattern]
-    qsv_cmd = base_args + ['-c:v', 'h264_qsv', '-global_quality', '18',
-                           '-pix_fmt', 'nv12', output_mp4]
-    sw_cmd = base_args + ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-                          '-pix_fmt', 'yuv420p', output_mp4]
+    margin = 10
+    overlay_x = vid_w - map_size - margin
+    overlay_y = vid_h - map_size - margin
+    filter_str = (
+        f"[1:v]fps={args.hz}[map];"
+        f"[0:v][map]overlay={overlay_x}:{overlay_y}:shortest=1"
+    )
+    audio_args = ['-an'] if args.no_audio else ['-c:a', 'aac', '-b:a', '128k']
+    qsv_cmd = (
+        ['ffmpeg', '-y', '-i', input_mp4,
+         '-framerate', str(args.hz), '-i', input_pattern,
+         '-filter_complex', filter_str,
+         '-c:v', 'h264_qsv', '-global_quality', '20']
+        + audio_args + [output_mp4]
+    )
+    sw_cmd = (
+        ['ffmpeg', '-y', '-i', input_mp4,
+         '-framerate', str(args.hz), '-i', input_pattern,
+         '-filter_complex', filter_str,
+         '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+         '-pix_fmt', 'yuv420p']
+        + audio_args + [output_mp4]
+    )
     result = subprocess.run(qsv_cmd, capture_output=True)
     if result.returncode != 0:
         print("  QSV unavailable, falling back to libx264...", flush=True)
         result = subprocess.run(sw_cmd, capture_output=True)
+        if result.returncode != 0:
+            print(f"  Encode error: {result.stderr[-500:]}", flush=True)
     else:
         print("  Encoded with Intel QSV", flush=True)
 
     shutil.rmtree(frames_dir)
-    size_kb = os.path.getsize(output_mp4) / 1024
+    size_mb = os.path.getsize(output_mp4) / (1024 * 1024)
     print(f"\nDone! {output_mp4}", flush=True)
-    print(f"  {size_kb:.0f} KB, {duration:.0f}s at {args.hz} fps", flush=True)
+    print(f"  {size_mb:.1f} MB, {duration:.0f}s at {args.hz} fps", flush=True)
 
 
 if __name__ == '__main__':
