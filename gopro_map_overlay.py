@@ -115,6 +115,7 @@ TILE_SERVERS = {
 }
 
 TILE_CACHE = {}
+TILE_CACHE_DIR = os.path.join(tempfile.gettempdir(), 'gopro_tile_cache')
 USER_AGENT = 'gopro-map-overlay/1.0 (https://github.com/MikeMontana1968/gopro-map-overlay)'
 
 
@@ -128,35 +129,86 @@ def _ll_to_tile(lat, lon, zoom):
 
 
 def _fetch_tile(tx, ty, zoom, map_type):
-    """Fetch a single 256x256 map tile, with in-memory caching."""
+    """Fetch a 256x256 map tile with memory + disk caching."""
     key = (tx, ty, zoom, map_type)
     if key in TILE_CACHE:
         return TILE_CACHE[key]
+
+    # Check disk cache
+    cache_dir = os.path.join(TILE_CACHE_DIR, map_type, str(zoom))
+    cache_path = os.path.join(cache_dir, f"{tx}_{ty}.png")
+    if os.path.isfile(cache_path):
+        img = Image.open(cache_path).convert('RGB')
+        TILE_CACHE[key] = img
+        return img
+
     url = TILE_SERVERS[map_type].format(z=zoom, x=tx, y=ty)
     try:
         req = Request(url, headers={'User-Agent': USER_AGENT})
-        resp = urlopen(req, timeout=15)
-        img = Image.open(BytesIO(resp.read())).convert('RGB')
+        resp = urlopen(req, timeout=5)
+        tile_data = resp.read()
+        img = Image.open(BytesIO(tile_data)).convert('RGB')
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_path, 'wb') as f:
+            f.write(tile_data)
     except Exception:
         img = Image.new('RGB', (256, 256), (200, 200, 200))
     TILE_CACHE[key] = img
     return img
 
 
-def choose_zoom(points, map_size):
-    """Pick a zoom level so the full GPS track fits in the map with padding."""
-    if len(points) < 2:
-        return 15
-    lats = [p['lat'] for p in points]
-    lons = [p['lon'] for p in points]
-    span = max(max(lats) - min(lats), max(lons) - min(lons))
-    if span == 0:
-        return 15
-    for z in range(18, 8, -1):
-        degrees_visible = 360 / (2 ** z) * (map_size / 256)
-        if degrees_visible > span * 1.5:
-            return z
-    return 10
+def prefetch_tiles(points, zoom_levels, map_size, map_type):
+    """Pre-fetch all tiles needed for the route at all zoom levels."""
+    import time
+    needed = set()
+    padding = 3
+    tiles_needed = (map_size // 256) + padding + 1
+    half = tiles_needed // 2
+
+    for z in zoom_levels:
+        for p in points:
+            cx, cy = _ll_to_tile(p['lat'], p['lon'], z)
+            center_tx, center_ty = int(cx), int(cy)
+            for dx in range(-half, half + 1):
+                for dy in range(-half, half + 1):
+                    needed.add((center_tx + dx, center_ty + dy, z))
+
+    # Remove already-cached tiles
+    to_fetch = []
+    for tx, ty, z in needed:
+        key = (tx, ty, z, map_type)
+        if key in TILE_CACHE:
+            continue
+        cache_path = os.path.join(TILE_CACHE_DIR, map_type, str(z), f"{tx}_{ty}.png")
+        if os.path.isfile(cache_path):
+            continue
+        to_fetch.append((tx, ty, z))
+
+    if not to_fetch:
+        print(f"  All {len(needed)} tiles already cached", flush=True)
+        return
+
+    print(f"  {len(needed)} tiles needed, {len(to_fetch)} to download...", flush=True)
+    for i, (tx, ty, z) in enumerate(to_fetch):
+        _fetch_tile(tx, ty, z, map_type)
+        if (i + 1) % 50 == 0:
+            print(f"    {i + 1}/{len(to_fetch)} tiles", flush=True)
+        time.sleep(0.05)  # rate limit: max 20 req/sec
+    print(f"  Tile prefetch complete", flush=True)
+
+
+CRUISE_ZOOM = 15  # ~1-2 mile context, good for 30-70 mph driving
+INTRO_ZOOM_START = 7  # state-level overview for the intro animation
+INTRO_DURATION = 5.0  # seconds for the zoom-in intro
+
+
+def _bearing(lat1, lon1, lat2, lon2):
+    """Compute forward bearing in degrees (0=north, 90=east) between two points."""
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlon = lon2 - lon1
+    x = math.sin(dlon) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    return math.degrees(math.atan2(x, y)) % 360
 
 
 def _get_font(size):
@@ -171,10 +223,16 @@ def _get_font(size):
 
 
 def render_map(center_lat, center_lon, trail, map_size, zoom, map_type,
-               timestamp=None, speed_mph=None):
-    """Render a single map frame with trail, position dot, and info bar."""
+               timestamp=None, speed_mph=None, heading=None):
+    """Render a single map frame with trail, position dot, and info bar.
+
+    If heading is provided (degrees, 0=north), the map is rotated so the
+    direction of travel points up.
+    """
     cx, cy = _ll_to_tile(center_lat, center_lon, zoom)
-    tiles_needed = (map_size // 256) + 3
+    # Fetch extra tiles to allow rotation without blank corners
+    padding = 2 if heading is None else 3
+    tiles_needed = (map_size // 256) + padding + 1
     half = tiles_needed // 2
     canvas_size = tiles_needed * 256
     canvas = Image.new('RGB', (canvas_size, canvas_size))
@@ -203,9 +261,16 @@ def render_map(center_lat, center_lon, trail, map_size, zoom, map_type,
     draw.ellipse([cpx - r, cpy - r, cpx + r, cpy + r],
                  fill=(255, 0, 0), outline=(255, 255, 255), width=2)
 
-    # Crop to map_size centered
-    left = canvas_size // 2 - map_size // 2
-    top = canvas_size // 2 - map_size // 2
+    # Rotate so heading points up, then crop centered
+    if heading is not None:
+        canvas = canvas.rotate(heading, resample=Image.BICUBIC,
+                               center=(cpx, cpy), fillcolor=(200, 200, 200))
+        left = cpx - map_size // 2
+        top = cpy - map_size // 2
+    else:
+        left = canvas_size // 2 - map_size // 2
+        top = canvas_size // 2 - map_size // 2
+
     cropped = canvas.crop((left, top, left + map_size, top + map_size))
 
     # Info bar (semi-transparent black strip at bottom)
@@ -308,15 +373,29 @@ def main():
         print(f"  Start time: {creation_time.strftime('%I:%M:%S %p')}", flush=True)
 
     map_size = args.size or min(vid_w, vid_h) // 4
-    zoom = args.zoom or choose_zoom(points, map_size)
+    cruise_zoom = args.zoom or CRUISE_ZOOM
+    intro_frames = int(INTRO_DURATION * args.hz)
 
     print(f"  Video: {vid_w}x{vid_h}, {duration:.1f}s", flush=True)
-    print(f"  Map: {map_size}x{map_size}px, zoom {zoom}, {args.map}", flush=True)
+    print(f"  Map: {map_size}x{map_size}px, cruise zoom {cruise_zoom}, {args.map}",
+          flush=True)
+    print(f"  Intro: {INTRO_DURATION}s zoom {INTRO_ZOOM_START} -> {cruise_zoom}",
+          flush=True)
+
+    # --- Step 2b: Pre-fetch map tiles ---
+    print("Pre-fetching map tiles...", flush=True)
+    all_zooms = list(range(INTRO_ZOOM_START, cruise_zoom + 1))
+    # Only sample every Nth point for prefetch (no need to check all 9000+)
+    sample_step = max(1, len(points) // 200)
+    sample_points = points[::sample_step] + [points[-1]]
+    prefetch_tiles(sample_points, all_zooms, map_size, args.map)
 
     # --- Step 3: Render map frames ---
     frames_dir = tempfile.mkdtemp(prefix='gopro_map_')
     total_frames = int(duration * args.hz) + 1
     print(f"Rendering {total_frames} map frames...", flush=True)
+
+    prev_heading = 0.0
 
     for idx in range(total_frames):
         t = idx / args.hz
@@ -326,12 +405,33 @@ def main():
         current = points[gps_idx]
         trail = points[:gps_idx + 1]
 
+        # Zoom: intro animation or cruise
+        if idx < intro_frames:
+            frac = idx / intro_frames
+            # Ease-in-out (smoothstep)
+            frac = frac * frac * (3 - 2 * frac)
+            zoom = INTRO_ZOOM_START + (cruise_zoom - INTRO_ZOOM_START) * frac
+            # render_map needs int zoom for tile fetching, so we step
+            zoom = int(round(zoom))
+        else:
+            zoom = cruise_zoom
+
+        # Heading: direction of travel (bearing from recent GPS points)
+        if gps_idx > 0:
+            # Average over a few points to smooth jitter
+            look_back = max(0, gps_idx - 5)
+            hdg = _bearing(points[look_back]['lat'], points[look_back]['lon'],
+                           current['lat'], current['lon'])
+            # Smooth heading transitions
+            prev_heading = prev_heading + 0.3 * (((hdg - prev_heading + 180) % 360) - 180)
+        heading = prev_heading
+
         ts = (creation_time + timedelta(seconds=t)) if creation_time else None
         speed_mph = current['speed'] * MPS_TO_MPH if current.get('speed') else None
 
         img = render_map(current['lat'], current['lon'], trail,
                          map_size, zoom, args.map,
-                         timestamp=ts, speed_mph=speed_mph)
+                         timestamp=ts, speed_mph=speed_mph, heading=heading)
 
         bordered = Image.new('RGB', (map_size + 4, map_size + 4), (255, 255, 255))
         bordered.paste(img, (2, 2))

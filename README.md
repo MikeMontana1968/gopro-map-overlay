@@ -10,10 +10,12 @@ Extracts the embedded GPS telemetry (GPMF) from GoPro footage and renders a movi
 
 - Parses GoPro's GPMF telemetry format directly (GPS5 and GPS9)
 - Three map styles: **street** (OpenStreetMap), **topo** (OpenTopoMap), **satellite** (ESRI)
+- **Heading-up rotation** — map rotates so direction of travel always points up (nav-style)
+- **Zoom-in intro** — 5-second animated zoom from state level to street level
 - Blue trail showing the route traveled so far
 - Red dot for current position
 - Semi-transparent info bar with clock time and speed (mph)
-- Auto-detects zoom level to fit the full track
+- Disk-based tile cache for fast re-runs
 - No API keys required
 
 ## Requirements
@@ -57,7 +59,7 @@ python gopro_map_overlay.py GH010157.MP4 \
 |------|---------|-------------|
 | `--map` | `street` | Map style: `street`, `topo`, or `satellite` |
 | `--hz` | `2` | Map update rate (frames per second) |
-| `--zoom` | auto | Override zoom level (auto-fits the full track) |
+| `--zoom` | `15` | Override cruise zoom level (15 = street-level detail) |
 | `--size` | 1/4 video height | Map thumbnail size in pixels |
 | `-o` / `--output` | `<input>_map_overlay.mp4` | Output file path |
 
@@ -74,8 +76,9 @@ The output is a small H.264 video (typically under 1 MB) matching the duration o
 
 1. **Extract** — Pulls the GPMF binary telemetry stream from the MP4 using FFmpeg
 2. **Parse** — Walks the GPMF container hierarchy (DEVC > STRM > GPS5/GPS9), applies SCAL divisors to get decimal lat/lon/alt/speed
-3. **Render** — For each time step, fetches map tiles, draws the trail and position dot, composites the time/speed info bar
-4. **Encode** — Assembles the frames into an H.264 video with FFmpeg
+3. **Pre-fetch** — Calculates all map tiles needed across the route and zoom levels, downloads them with a disk cache
+4. **Render** — For each time step, composites cached tiles, draws trail and position dot, rotates by heading, adds time/speed info bar
+5. **Encode** — Assembles the frames into an H.264 video with FFmpeg
 
 ## Supported cameras
 
