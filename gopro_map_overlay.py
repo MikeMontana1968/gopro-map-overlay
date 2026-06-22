@@ -343,6 +343,8 @@ def main():
                         help='Override zoom level (auto-detected by default)')
     parser.add_argument('--size', type=int, default=None,
                         help='Map size in pixels (default: 1/4 of video height)')
+    parser.add_argument('--scale', type=int, default=None,
+                        help='Output height in pixels (e.g. 1080 for 1080p)')
     parser.add_argument('--no-intro', action='store_true',
                         help='Skip the zoom-in intro animation')
     parser.add_argument('--no-audio', action='store_true',
@@ -402,11 +404,19 @@ def main():
     if creation_time:
         print(f"  Start time: {creation_time.strftime('%I:%M:%S %p')}", flush=True)
 
-    map_size = args.size or min(vid_w, vid_h) // 4
+    # Output resolution (may differ from source if --scale is used)
+    if args.scale:
+        out_h = args.scale
+        out_w = int(vid_w * out_h / vid_h)
+        out_w = out_w + (out_w % 2)  # ensure even
+    else:
+        out_w, out_h = vid_w, vid_h
+
+    map_size = args.size or min(out_w, out_h) // 4
     cruise_zoom = args.zoom or CRUISE_ZOOM
     intro_frames = 0 if args.no_intro else int(INTRO_DURATION * args.hz)
 
-    print(f"  Video: {vid_w}x{vid_h}, {duration:.1f}s", flush=True)
+    print(f"  Video: {vid_w}x{vid_h} -> {out_w}x{out_h}, {duration:.1f}s", flush=True)
     print(f"  Map: {map_size}x{map_size}px, cruise zoom {cruise_zoom}, {args.map}",
           flush=True)
     if intro_frames:
@@ -474,25 +484,28 @@ def main():
     print("Compositing onto source video...", flush=True)
     input_pattern = os.path.join(frames_dir, 'frame_%06d.png')
     margin = 10
-    overlay_x = vid_w - map_size - margin
-    overlay_y = vid_h - map_size - margin
+    overlay_x = out_w - map_size - margin
+    overlay_y = out_h - map_size - margin
+    scale_filter = f"[0:v]scale={out_w}:{out_h}[base];" if args.scale else ""
+    base_label = "[base]" if args.scale else "[0:v]"
     filter_str = (
+        f"{scale_filter}"
         f"[1:v]fps={args.hz}[map];"
-        f"[0:v][map]overlay={overlay_x}:{overlay_y}:shortest=1"
+        f"{base_label}[map]overlay={overlay_x}:{overlay_y}:shortest=1"
     )
     audio_args = ['-an'] if args.no_audio else ['-c:a', 'aac', '-b:a', '128k']
     qsv_cmd = (
         ['ffmpeg', '-y', '-i', input_mp4,
          '-framerate', str(args.hz), '-i', input_pattern,
          '-filter_complex', filter_str,
-         '-c:v', 'h264_qsv', '-global_quality', '20']
+         '-c:v', 'h264_qsv', '-global_quality', '28']
         + audio_args + [output_mp4]
     )
     sw_cmd = (
         ['ffmpeg', '-y', '-i', input_mp4,
          '-framerate', str(args.hz), '-i', input_pattern,
          '-filter_complex', filter_str,
-         '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+         '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
          '-pix_fmt', 'yuv420p']
         + audio_args + [output_mp4]
     )
