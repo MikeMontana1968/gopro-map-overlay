@@ -199,7 +199,7 @@ def prefetch_tiles(points, zoom_levels, map_size, map_type):
 
 CRUISE_ZOOM = 15  # ~1-2 mile context, good for 30-70 mph driving
 INTRO_ZOOM_START = 7  # state-level overview for the intro animation
-INTRO_DURATION = 5.0  # seconds for the zoom-in intro
+INTRO_DURATION = 10.0  # seconds for the zoom-in intro
 
 
 def _bearing(lat1, lon1, lat2, lon2):
@@ -408,8 +408,8 @@ def main():
         # Zoom: intro animation or cruise
         if idx < intro_frames:
             frac = idx / intro_frames
-            # Ease-in-out (smoothstep)
-            frac = frac * frac * (3 - 2 * frac)
+            # Ease-in-out (smootherstep — zero velocity AND acceleration at endpoints)
+            frac = frac * frac * frac * (frac * (frac * 6 - 15) + 10)
             zoom = INTRO_ZOOM_START + (cruise_zoom - INTRO_ZOOM_START) * frac
             # render_map needs int zoom for tile fetching, so we step
             zoom = int(round(zoom))
