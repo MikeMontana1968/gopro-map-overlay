@@ -444,13 +444,18 @@ def main():
             print(f"  {idx + 1}/{total_frames}", flush=True)
 
     # --- Step 4: Encode overlay video ---
-    print("Encoding overlay video...", flush=True)
-    subprocess.run([
-        'ffmpeg', '-y', '-framerate', str(args.hz),
-        '-i', os.path.join(frames_dir, 'frame_%06d.png'),
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-        '-pix_fmt', 'yuv420p', output_mp4
-    ], capture_output=True)
+    input_pattern = os.path.join(frames_dir, 'frame_%06d.png')
+    base_args = ['ffmpeg', '-y', '-framerate', str(args.hz), '-i', input_pattern]
+    qsv_cmd = base_args + ['-c:v', 'h264_qsv', '-global_quality', '18',
+                           '-pix_fmt', 'nv12', output_mp4]
+    sw_cmd = base_args + ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+                          '-pix_fmt', 'yuv420p', output_mp4]
+    result = subprocess.run(qsv_cmd, capture_output=True)
+    if result.returncode != 0:
+        print("  QSV unavailable, falling back to libx264...", flush=True)
+        result = subprocess.run(sw_cmd, capture_output=True)
+    else:
+        print("  Encoded with Intel QSV", flush=True)
 
     shutil.rmtree(frames_dir)
     size_kb = os.path.getsize(output_mp4) / 1024
