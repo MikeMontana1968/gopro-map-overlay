@@ -310,7 +310,8 @@ def prefetch_tiles(points, zoom_levels, map_size, map_type):
 
 CRUISE_ZOOM = 15  # ~1-2 mile context, good for 30-70 mph driving
 INTRO_ZOOM_START = 7  # state-level overview for the intro animation
-INTRO_DURATION = 10.0  # seconds for the zoom-in intro
+INTRO_DURATION = 15.0  # seconds for the zoom-in intro
+INTRO_HZ = 10  # higher update rate during zoom for smooth animation
 
 
 def _bearing(lat1, lon1, lat2, lon2):
@@ -544,7 +545,8 @@ def main():
 
     map_size = args.size or min(out_w, out_h) // 4
     cruise_zoom = args.zoom or CRUISE_ZOOM
-    intro_frames = 0 if args.no_intro else int(INTRO_DURATION * args.hz)
+    overlay_fps = INTRO_HZ if not args.no_intro else args.hz
+    intro_frames = 0 if args.no_intro else int(INTRO_DURATION * INTRO_HZ)
 
     pitch_angles = []
     if args.pitch and accl_samples:
@@ -558,8 +560,8 @@ def main():
     print(f"  Map: {map_size}x{map_size}px, cruise zoom {cruise_zoom}, {args.map}",
           flush=True)
     if intro_frames:
-        print(f"  Intro: {INTRO_DURATION}s zoom {INTRO_ZOOM_START} -> {cruise_zoom}",
-              flush=True)
+        print(f"  Intro: {INTRO_DURATION}s zoom {INTRO_ZOOM_START} -> {cruise_zoom} "
+              f"at {INTRO_HZ}Hz, cruise at {args.hz}Hz", flush=True)
 
     # --- Step 2b: Pre-fetch map tiles ---
     print("Pre-fetching map tiles...", flush=True)
@@ -571,13 +573,13 @@ def main():
 
     # --- Step 3: Render map frames ---
     frames_dir = tempfile.mkdtemp(prefix='gopro_map_')
-    total_frames = int(duration * args.hz) + 1
-    print(f"Rendering {total_frames} map frames...", flush=True)
+    total_frames = int(duration * overlay_fps) + 1
+    print(f"Rendering {total_frames} map frames at {overlay_fps}Hz...", flush=True)
 
     prev_heading = 0.0
 
     for idx in range(total_frames):
-        t = idx / args.hz
+        t = idx / overlay_fps
         if t > duration:
             break
         gps_idx = min(int(t / duration * (len(points) - 1)), len(points) - 1)
@@ -643,7 +645,7 @@ def main():
         parts.append(f"[_cmd]rotate=a=0:ow=iw:oh=ih:fillcolor=black[rotated]")
         video_label = "[rotated]"
 
-    parts.append(f"[1:v]fps={args.hz}[map]")
+    parts.append(f"[1:v]fps={overlay_fps}[map]")
 
     overlay_out = "[comp]" if args.tblend else ""
     parts.append(
@@ -658,14 +660,14 @@ def main():
     audio_args = ['-an'] if args.no_audio else ['-c:a', 'aac', '-b:a', '128k']
     qsv_cmd = (
         ['ffmpeg', '-y', '-i', input_mp4,
-         '-framerate', str(args.hz), '-i', input_pattern,
+         '-framerate', str(overlay_fps), '-i', input_pattern,
          '-filter_complex', filter_str,
          '-c:v', 'h264_qsv', '-global_quality', '28']
         + audio_args + [output_mp4]
     )
     sw_cmd = (
         ['ffmpeg', '-y', '-i', input_mp4,
-         '-framerate', str(args.hz), '-i', input_pattern,
+         '-framerate', str(overlay_fps), '-i', input_pattern,
          '-filter_complex', filter_str,
          '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
          '-pix_fmt', 'yuv420p']
@@ -690,7 +692,7 @@ def main():
         sys.exit(1)
     size_mb = os.path.getsize(output_mp4) / (1024 * 1024)
     print(f"\nDone! {output_mp4}", flush=True)
-    print(f"  {size_mb:.1f} MB, {duration:.0f}s at {args.hz} fps", flush=True)
+    print(f"  {size_mb:.1f} MB, {duration:.0f}s at {overlay_fps} fps", flush=True)
 
 
 if __name__ == '__main__':
