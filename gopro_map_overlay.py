@@ -311,7 +311,7 @@ def prefetch_tiles(points, zoom_levels, map_size, map_type):
 CRUISE_ZOOM = 15  # ~1-2 mile context, good for 30-70 mph driving
 INTRO_ZOOM_START = 7  # state-level overview for the intro animation
 INTRO_DURATION = 15.0  # seconds for the zoom-in intro
-INTRO_HZ = 10  # higher update rate during zoom for smooth animation
+INTRO_HZ = 20  # higher update rate during zoom for smooth animation
 
 
 def _bearing(lat1, lon1, lat2, lon2):
